@@ -1,40 +1,51 @@
 #!/usr/bin/env python3
 """
 ╔══════════════════════════════════════════╗
-║     FASE 1 — Library & Pencarian Lagu   ║
-║     (versi fixed — semua bug diperbaiki) ║
+║           TUI Music Player               ║
+║        — Versi Final —                   ║
 ╚══════════════════════════════════════════╝
 
-FIX LOG:
-  [FIX-1] stderr diarahkan ke file log agar tidak merusak tampilan curses
-          (bug: pesan mutagen "comment():584 error" muncul di layar)
-  [FIX-2] Perhitungan area list diperbaiki dengan safe_list_area()
-          (bug: status bar / volume hilang di terminal kecil atau scroll bawah)
-  [FIX-3] play() sekarang menampilkan pesan error yang jelas ke status bar
-          (bug: lagu tidak bisa diputar tanpa pesan apapun)
-  [FIX-4] Fallback pygame.mixer.Sound untuk format yang gagal di music loader
-  [FIX-5] Validasi file sebelum diputar (exists, readable, ukuran > 0)
+Cara install:
+    pip install pygame mutagen
+
+Struktur folder:
+    proyek/
+    ├── library.py        ← file ini
+    ├── library.db        ← database otomatis dibuat
+    ├── player.log        ← log error otomatis dibuat
+    └── music/            ← taruh lagu di sini
+        ├── lagu1.mp3
+        ├── lagu2.flac
+        └── subfolder/
+            └── lagu3.ogg
 
 Cara jalankan:
     python3 library.py
-    python3 library.py /path/ke/folder/musik
 
-Log error tersimpan di:
-    ~/.config/tui-player/error.log
+Kontrol:
+    ↑ / ↓      navigasi daftar lagu
+    ENTER       putar lagu yang dipilih
+    SPACE       pause / resume
+    n / p       lagu berikutnya / sebelumnya
+    + / -       volume naik / turun
+    /           mulai mengetik pencarian
+    ESC         keluar mode pencarian
+    1 / 2       ganti tab (Semua / Cari)
+    r           scan ulang folder music/
+    q           keluar
 """
 
-# ─────────────────────────────────────────────────────────────
-#  [FIX-1] Arahkan stderr ke file log SEBELUM import apapun
-#  Ini mencegah pesan error mutagen / library lain merusak
-#  tampilan curses di terminal
-# ─────────────────────────────────────────────────────────────
-import sys
-import os
+# ─────────────────────────────────────────
+#  Redirect stderr ke log file
+#  Harus dilakukan SEBELUM import lain
+#  agar pesan error tidak merusak tampilan
+# ─────────────────────────────────────────
+import sys, os
+from pathlib import Path
 
-_LOG_DIR  = os.path.join(os.path.expanduser("~"), ".config", "tui-player")
-os.makedirs(_LOG_DIR, exist_ok=True)
-_LOG_FILE = open(os.path.join(_LOG_DIR, "error.log"), "a", buffering=1)
-sys.stderr = _LOG_FILE
+_BASE   = Path(__file__).parent.resolve()
+_LOG    = open(_BASE / "player.log", "a", buffering=1)
+sys.stderr = _LOG
 
 # ─────────────────────────────────────────
 #  Import standar
@@ -44,8 +55,6 @@ import sqlite3
 import time
 import threading
 import warnings
-from pathlib import Path
-from datetime import datetime
 
 # ─────────────────────────────────────────
 #  Import library audio & metadata
@@ -64,308 +73,287 @@ try:
 except ImportError:
     MUTAGEN_OK = False
 
-# Format audio yang didukung
-SUPPORTED_FORMATS = {".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac"}
+# ─────────────────────────────────────────
+#  Konfigurasi path & format
+# ─────────────────────────────────────────
+MUSIC_DIR     = _BASE / "music"
+DB_PATH       = _BASE / "library.db"
+AUDIO_FORMATS = {".mp3", ".flac", ".ogg", ".wav", ".m4a", ".aac"}
 
-# Konstanta layout — berapa baris yang selalu ada di atas/bawah
-TOP_ROWS    = 2   # tab_bar + separator
-BOTTOM_ROWS = 3   # separator + status_bar + help_bar
+# Konstanta layout layar
+_TOP = 2   # baris terpakai di atas  (tabbar + separator)
+_BOT = 4   # baris terpakai di bawah (separator + nowplaying + status + help)
 
 
 # ══════════════════════════════════════════
-#  KELAS: MusicLibrary
+#  SETUP FOLDER MUSIC/
 # ══════════════════════════════════════════
-class MusicLibrary:
-    """Database SQLite untuk koleksi lagu."""
+def setup_music_folder():
+    """Buat folder music/ dan README jika belum ada."""
+    MUSIC_DIR.mkdir(exist_ok=True)
+    readme = MUSIC_DIR / "README.txt"
+    if not readme.exists():
+        readme.write_text(
+            "Taruh file musik kamu di folder ini.\n"
+            "Format yang didukung: mp3, flac, ogg, wav, m4a, aac\n"
+            "Subfolder juga terbaca otomatis.\n\n"
+            "Setelah menambah lagu, tekan  r  di player untuk refresh.\n",
+            encoding="utf-8"
+        )
 
-    DB_DIR  = Path.home() / ".config" / "tui-player"
-    DB_PATH = DB_DIR / "library.db"
+
+# ══════════════════════════════════════════
+#  KELAS: Library  (Database)
+# ══════════════════════════════════════════
+class Library:
+    """
+    Kelola koleksi lagu dengan SQLite.
+    - Scan folder music/ secara otomatis
+    - Simpan metadata agar tidak perlu scan ulang tiap buka
+    - Cari lagu berdasarkan judul, artis, atau album
+    """
 
     def __init__(self):
-        self.DB_DIR.mkdir(parents=True, exist_ok=True)
-        self.conn     = sqlite3.connect(str(self.DB_PATH), check_same_thread=False)
+        self.conn  = sqlite3.connect(str(DB_PATH), check_same_thread=False)
         self.conn.row_factory = sqlite3.Row
-        self._db_lock = threading.Lock()
-        self._create_tables()
+        self._lock = threading.Lock()
+        self._init_db()
 
-        self.scan_total    = 0
-        self.scan_progress = 0
-        self.scan_running  = False
+        # Status scan (dipakai progress bar di TUI)
+        self.scanning   = False
+        self.scan_done  = 0
+        self.scan_total = 0
 
-    def _create_tables(self):
-        with self._db_lock:
-            self.conn.executescript("""
+    def _init_db(self):
+        with self._lock:
+            self.conn.execute("""
                 CREATE TABLE IF NOT EXISTS songs (
-                    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-                    path       TEXT    UNIQUE NOT NULL,
-                    title      TEXT    NOT NULL DEFAULT 'Unknown Title',
-                    artist     TEXT    NOT NULL DEFAULT 'Unknown Artist',
-                    album      TEXT    NOT NULL DEFAULT 'Unknown Album',
-                    duration   REAL    NOT NULL DEFAULT 0.0,
-                    file_size  INTEGER NOT NULL DEFAULT 0,
-                    added_at   TEXT    NOT NULL
-                );
-                CREATE INDEX IF NOT EXISTS idx_title  ON songs(title);
-                CREATE INDEX IF NOT EXISTS idx_artist ON songs(artist);
-                CREATE INDEX IF NOT EXISTS idx_album  ON songs(album);
+                    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path     TEXT UNIQUE NOT NULL,
+                    title    TEXT NOT NULL DEFAULT '',
+                    artist   TEXT NOT NULL DEFAULT '',
+                    album    TEXT NOT NULL DEFAULT '',
+                    duration REAL NOT NULL DEFAULT 0
+                )
             """)
             self.conn.commit()
 
-    # ── Scan folder ───────────────────────
-    def scan_folder(self, folder: str, callback=None):
-        path = Path(folder).resolve()
-        if not path.exists():
-            return
+    # ── Scan folder music/ ────────────────
+    def scan(self, on_done=None):
+        """Scan folder music/ di background (tidak memblokir TUI)."""
         t = threading.Thread(
-            target=self._scan_worker,
-            args=(str(path), callback),
-            daemon=True
+            target=self._scan_worker, args=(on_done,), daemon=True
         )
         t.start()
-        return t
 
-    def _scan_worker(self, folder: str, callback=None):
-        self.scan_running  = True
-        self.scan_progress = 0
+    def _scan_worker(self, on_done):
+        self.scanning  = True
+        self.scan_done = 0
 
-        all_files = [
-            str(f) for f in Path(folder).rglob("*")
-            if f.suffix.lower() in SUPPORTED_FORMATS
-        ]
+        # Kumpulkan semua file audio
+        all_files = sorted(
+            f for f in MUSIC_DIR.rglob("*")
+            if f.suffix.lower() in AUDIO_FORMATS
+        )
         self.scan_total = len(all_files)
 
-        with self._db_lock:
+        # Path yang sudah ada di DB — lewati agar tidak proses ulang
+        with self._lock:
             existing = {
-                row[0] for row in
+                r[0] for r in
                 self.conn.execute("SELECT path FROM songs").fetchall()
             }
 
-        new_songs = []
-        for filepath in all_files:
-            self.scan_progress += 1
-            if filepath in existing:
-                if callback:
-                    callback(self.scan_progress, self.scan_total,
-                             filepath, skipped=True)
+        batch = []
+        for f in all_files:
+            self.scan_done += 1
+            if str(f) in existing:
                 continue
+            batch.append(self._read_meta(f))
+            if len(batch) >= 30:
+                self._insert(batch)
+                batch.clear()
 
-            meta = self._read_metadata(filepath)
-            new_songs.append(meta)
-            if callback:
-                callback(self.scan_progress, self.scan_total,
-                         filepath, skipped=False)
+        if batch:
+            self._insert(batch)
 
-            if len(new_songs) >= 50:
-                self._bulk_insert(new_songs)
-                new_songs = []
+        self.scanning = False
+        if on_done:
+            on_done(len(all_files))
 
-        if new_songs:
-            self._bulk_insert(new_songs)
-
-        self.scan_running = False
-
-    def _bulk_insert(self, songs: list):
-        now = datetime.now().isoformat()
-        with self._db_lock:
+    def _insert(self, songs: list):
+        with self._lock:
             self.conn.executemany(
-                """INSERT OR IGNORE INTO songs
-                   (path,title,artist,album,duration,file_size,added_at)
-                   VALUES (:path,:title,:artist,:album,:duration,:file_size,:added_at)""",
-                [{**s, "added_at": now} for s in songs]
+                "INSERT OR IGNORE INTO songs "
+                "(path,title,artist,album,duration) "
+                "VALUES (:path,:title,:artist,:album,:duration)",
+                songs
             )
             self.conn.commit()
 
-    def _read_metadata(self, filepath: str) -> dict:
-        """Baca metadata dengan aman — semua exception ditangkap."""
-        title    = Path(filepath).stem
-        artist   = "Unknown Artist"
-        album    = "Unknown Album"
-        duration = 0.0
-        size     = 0
-
-        try:
-            size = os.path.getsize(filepath)
-        except OSError:
-            pass
+    def _read_meta(self, filepath: Path) -> dict:
+        """Baca metadata dari file audio. Fallback ke nama file jika gagal."""
+        title  = filepath.stem
+        artist = ""
+        album  = ""
+        dur    = 0.0
 
         if MUTAGEN_OK:
             try:
-                # [FIX-1] suppress warnings mutagen agar tidak bocor ke stderr
                 with warnings.catch_warnings():
                     warnings.simplefilter("ignore")
-                    audio = MutagenFile(filepath)
+                    audio = MutagenFile(str(filepath))
 
-                if audio is not None:
-                    for key in ("title", "TIT2", "\xa9nam", "TITLE"):
-                        if key in audio:
-                            v = audio[key]
-                            t = str(v[0] if isinstance(v, list) else v).strip()
-                            if t:
-                                title = t
-                            break
-                    for key in ("artist", "TPE1", "\xa9ART", "ARTIST"):
-                        if key in audio:
-                            v = audio[key]
-                            a = str(v[0] if isinstance(v, list) else v).strip()
-                            if a:
-                                artist = a
-                            break
-                    for key in ("album", "TALB", "\xa9alb", "ALBUM"):
-                        if key in audio:
-                            v = audio[key]
-                            al = str(v[0] if isinstance(v, list) else v).strip()
-                            if al:
-                                album = al
-                            break
-                    if hasattr(audio, "info") and hasattr(audio.info, "length"):
-                        duration = float(audio.info.length)
+                if audio:
+                    def _tag(keys):
+                        for k in keys:
+                            if k in audio:
+                                v = audio[k]
+                                return str(
+                                    v[0] if isinstance(v, list) else v
+                                ).strip()
+                        return ""
+
+                    title  = _tag(["title","TIT2","\xa9nam"]) or title
+                    artist = _tag(["artist","TPE1","\xa9ART"])
+                    album  = _tag(["album","TALB","\xa9alb"])
+                    dur    = getattr(
+                        getattr(audio, "info", None), "length", 0.0
+                    )
             except Exception as e:
-                print(f"[metadata error] {filepath}: {e}", file=_LOG_FILE)
+                print(f"[meta] {filepath.name}: {e}", file=sys.__stderr__)
 
         return {
-            "path"     : filepath,
-            "title"    : (title  or Path(filepath).stem)[:200],
-            "artist"   : (artist or "Unknown Artist")[:200],
-            "album"    : (album  or "Unknown Album")[:200],
-            "duration" : duration,
-            "file_size": size,
+            "path"    : str(filepath),
+            "title"   : title[:200],
+            "artist"  : artist[:200],
+            "album"   : album[:200],
+            "duration": float(dur),
         }
 
-    # ── Query database ────────────────────
-    def search(self, query: str, limit: int = 300) -> list:
-        if not query.strip():
-            return self.get_all(limit)
-        p = f"%{query.strip()}%"
-        with self._db_lock:
-            rows = self.conn.execute(
-                """SELECT id,path,title,artist,album,duration FROM songs
-                   WHERE title LIKE ? OR artist LIKE ? OR album LIKE ?
-                   ORDER BY artist,album,title LIMIT ?""",
-                (p, p, p, limit)
-            ).fetchall()
-        return [dict(r) for r in rows]
+    # ── Query ─────────────────────────────
+    def all_songs(self) -> list:
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT * FROM songs ORDER BY artist,album,title"
+            ).fetchall()]
 
-    def get_all(self, limit: int = 500) -> list:
-        with self._db_lock:
-            rows = self.conn.execute(
-                """SELECT id,path,title,artist,album,duration FROM songs
-                   ORDER BY artist,album,title LIMIT ?""",
-                (limit,)
-            ).fetchall()
-        return [dict(r) for r in rows]
+    def search(self, q: str) -> list:
+        if not q.strip():
+            return self.all_songs()
+        p = f"%{q.strip()}%"
+        with self._lock:
+            return [dict(r) for r in self.conn.execute(
+                "SELECT * FROM songs "
+                "WHERE title LIKE ? OR artist LIKE ? OR album LIKE ? "
+                "ORDER BY artist,album,title",
+                (p, p, p)
+            ).fetchall()]
 
-    def total_songs(self) -> int:
-        with self._db_lock:
+    def count(self) -> int:
+        with self._lock:
             return self.conn.execute(
                 "SELECT COUNT(*) FROM songs"
             ).fetchone()[0]
 
     def close(self):
-        with self._db_lock:
+        with self._lock:
             self.conn.close()
 
 
 # ══════════════════════════════════════════
-#  KELAS: AudioEngine
+#  KELAS: Player  (Audio Engine)
 # ══════════════════════════════════════════
-class AudioEngine:
+class Player:
+    """Putar, pause, stop audio. Semua urusan pygame ada di sini."""
+
     def __init__(self):
-        self.is_playing   = False
-        self.is_paused    = False
-        self.current_file = None
-        self.volume       = 0.7
-        self.last_error   = ""    # [FIX-3]
+        self.playing = False
+        self.paused  = False
+        self.volume  = 0.7
+        self.error   = ""
 
         if PYGAME_OK:
-            pygame.mixer.init(frequency=44100, size=-16, channels=2, buffer=2048)
+            pygame.mixer.init(44100, -16, 2, 2048)
             pygame.mixer.music.set_volume(self.volume)
 
-    def play(self, filepath: str) -> bool:
-        """
-        [FIX-3][FIX-4][FIX-5] Putar file audio dengan validasi lengkap.
-        Mengembalikan True jika berhasil, False jika gagal.
-        Pesan error tersimpan di self.last_error.
-        """
-        self.last_error = ""
-        path = Path(filepath)
+    def play(self, path: str) -> bool:
+        """Putar file. Kembalikan True jika berhasil."""
+        self.error = ""
+        p = Path(path)
 
-        # [FIX-5] Validasi file
-        if not path.exists():
-            self.last_error = f"File tidak ada: {path.name[:40]}"
+        # Validasi file sebelum diputar
+        if not p.exists():
+            self.error = f"File tidak ada: {p.name[:40]}"
             return False
-        if path.stat().st_size == 0:
-            self.last_error = f"File kosong: {path.name[:40]}"
-            return False
-        if path.suffix.lower() not in SUPPORTED_FORMATS:
-            self.last_error = f"Format tidak didukung: {path.suffix}"
+        if p.stat().st_size == 0:
+            self.error = f"File kosong: {p.name[:40]}"
             return False
         if not PYGAME_OK:
-            self.last_error = "pygame belum terinstall"
+            self.error = "pygame belum terinstall"
             return False
 
-        # Coba dengan music loader (streaming, hemat RAM)
+        # Coba putar dengan music loader (hemat RAM)
         try:
-            pygame.mixer.music.load(str(path))
+            pygame.mixer.music.load(str(p))
             pygame.mixer.music.play()
-            self.current_file = str(path)
-            self.is_playing   = True
-            self.is_paused    = False
+            self.playing = True
+            self.paused  = False
             return True
         except Exception as e:
-            print(f"[play/music] {path}: {e}", file=_LOG_FILE)
+            print(f"[play/music] {p.name}: {e}", file=sys.__stderr__)
 
-        # [FIX-4] Fallback ke Sound loader (cocok untuk WAV tertentu)
+        # Fallback ke Sound loader
         try:
-            sound = pygame.mixer.Sound(str(path))
-            sound.set_volume(self.volume)
+            snd = pygame.mixer.Sound(str(p))
+            snd.set_volume(self.volume)
             pygame.mixer.stop()
-            sound.play()
-            self.current_file = str(path)
-            self.is_playing   = True
-            self.is_paused    = False
+            snd.play()
+            self.playing = True
+            self.paused  = False
             return True
-        except Exception as e2:
-            self.last_error = f"Tidak bisa diputar: {path.name[:35]}"
-            print(f"[play/sound] {path}: {e2}", file=_LOG_FILE)
-            self.is_playing = False
+        except Exception as e:
+            self.error   = f"Gagal diputar: {p.name[:35]}"
+            self.playing = False
+            print(f"[play/sound] {p.name}: {e}", file=sys.__stderr__)
             return False
 
     def toggle_pause(self):
-        if not PYGAME_OK or not self.is_playing:
+        if not PYGAME_OK or not self.playing:
             return
-        if self.is_paused:
+        if self.paused:
             pygame.mixer.music.unpause()
-            self.is_paused = False
+            self.paused = False
         else:
             pygame.mixer.music.pause()
-            self.is_paused = True
+            self.paused = True
 
     def stop(self):
         if PYGAME_OK:
             pygame.mixer.music.stop()
-        self.is_playing = False
-        self.is_paused  = False
+        self.playing = False
+        self.paused  = False
 
-    def is_song_finished(self) -> bool:
-        if not PYGAME_OK or not self.is_playing or self.is_paused:
+    def finished(self) -> bool:
+        if not PYGAME_OK or not self.playing or self.paused:
             return False
         return not pygame.mixer.music.get_busy()
 
-    def volume_up(self):
+    def vol_up(self):
         self.volume = min(1.0, self.volume + 0.05)
         if PYGAME_OK:
             pygame.mixer.music.set_volume(self.volume)
 
-    def volume_down(self):
+    def vol_down(self):
         self.volume = max(0.0, self.volume - 0.05)
         if PYGAME_OK:
             pygame.mixer.music.set_volume(self.volume)
 
-    def get_position(self) -> float:
-        if not PYGAME_OK or not self.is_playing:
+    def position(self) -> float:
+        if not PYGAME_OK or not self.playing:
             return 0.0
-        pos = pygame.mixer.music.get_pos()
-        return pos / 1000.0 if pos >= 0 else 0.0
+        ms = pygame.mixer.music.get_pos()
+        return ms / 1000.0 if ms >= 0 else 0.0
 
     def cleanup(self):
         if PYGAME_OK:
@@ -373,444 +361,432 @@ class AudioEngine:
 
 
 # ══════════════════════════════════════════
-#  KELAS: LibraryTUI
+#  KELAS: TUI  (Tampilan Terminal)
 # ══════════════════════════════════════════
-class LibraryTUI:
-    REFRESH_MS  = 300
-    TAB_LIBRARY = 0
-    TAB_SEARCH  = 1
-    TAB_PLAYING = 2
+class TUI:
+    """
+    Antarmuka terminal dengan 2 tab:
+      [1] Semua  — seluruh lagu di database
+      [2] Cari   — pencarian real-time
+    """
 
-    def __init__(self, stdscr, library: MusicLibrary,
-                 engine: AudioEngine, music_folder: str):
-        self.screen       = stdscr
-        self.library      = library
-        self.engine       = engine
-        self.music_folder = music_folder
-        self.current_tab  = self.TAB_LIBRARY
+    REFRESH    = 300   # ms antar refresh layar
+    TAB_ALL    = 0
+    TAB_SEARCH = 1
 
-        self.lib_tracks  = []
-        self.lib_sel     = 0
-        self.lib_scroll  = 0
+    def __init__(self, scr, lib: Library, player: Player):
+        self.scr    = scr
+        self.lib    = lib
+        self.player = player
 
-        self.search_query  = ""
-        self.search_tracks = []
-        self.search_sel    = 0
-        self.search_scroll = 0
-        self.search_mode   = False
+        self.tab = self.TAB_ALL
 
-        self.active_tracks = []
-        self.active_idx    = 0
+        # Daftar lagu per tab
+        self.all_songs = []
+        self.results   = []
+        self.query     = ""
+        self.typing    = False  # True = mode mengetik pencarian
 
-        self._status_msg   = ""
-        self._status_timer = 0.0
+        # Navigasi
+        self.sel    = 0
+        self.scroll = 0
 
-        self._setup_colors()
+        # Antrian putar (lagu yang aktif saat ini)
+        self.queue = []
+        self.q_idx = 0
+
+        # Pesan notifikasi sementara
+        self._msg   = ""
+        self._msg_t = 0.0
+
+        self._init_colors()
         curses.curs_set(0)
-        self.screen.timeout(self.REFRESH_MS)
+        self.scr.timeout(self.REFRESH)
+        self._reload()
 
-        self._reload_library()
-        self._start_scan()
-
-    def _setup_colors(self):
+    def _init_colors(self):
         curses.start_color()
         curses.use_default_colors()
-        curses.init_pair(1, curses.COLOR_CYAN,   -1)
-        curses.init_pair(2, curses.COLOR_GREEN,  -1)
-        curses.init_pair(3, curses.COLOR_BLACK,  curses.COLOR_WHITE)
-        curses.init_pair(4, curses.COLOR_YELLOW, -1)
-        curses.init_pair(5, curses.COLOR_RED,    -1)
-        curses.init_pair(6, curses.COLOR_WHITE,  curses.COLOR_BLUE)
+        curses.init_pair(1, curses.COLOR_CYAN,   -1)                   # header / separator
+        curses.init_pair(2, curses.COLOR_GREEN,  -1)                   # lagu aktif
+        curses.init_pair(3, curses.COLOR_BLACK,  curses.COLOR_WHITE)   # baris terpilih
+        curses.init_pair(4, curses.COLOR_YELLOW, -1)                   # status bar
+        curses.init_pair(5, curses.COLOR_RED,    -1)                   # error / kosong
+        curses.init_pair(6, curses.COLOR_WHITE,  curses.COLOR_BLUE)    # tab aktif
 
-    def _reload_library(self):
-        self.lib_tracks    = self.library.get_all()
-        self.search_tracks = self.library.search(self.search_query)
+    def _reload(self):
+        self.all_songs = self.lib.all_songs()
+        self.results   = self.lib.search(self.query)
 
-    def _start_scan(self):
-        def on_progress(progress, total, filepath, skipped=False):
-            if not skipped:
-                pct  = int(progress / total * 100) if total else 0
-                name = Path(filepath).name[:25]
-                self._status_msg   = f"Scan {pct}% — {name}"
-                self._status_timer = time.time() + 1.0
-            if progress % 50 == 0:
-                self._reload_library()
+    def notify(self, msg: str, secs: float = 3.0):
+        self._msg   = msg
+        self._msg_t = time.time() + secs
 
-        def after_scan():
-            time.sleep(0.3)
-            self._reload_library()
-            n = self.library.total_songs()
-            self._status_msg   = f"Scan selesai — {n} lagu ditemukan"
-            self._status_timer = time.time() + 4.0
+    # ── List yang aktif sesuai tab ────────
+    @property
+    def _list(self):
+        return self.all_songs if self.tab == self.TAB_ALL else self.results
 
-        self.library.scan_folder(self.music_folder, callback=on_progress)
-        threading.Thread(target=after_scan, daemon=True).start()
-
-    # ── [FIX-2] Hitung area list yang aman ──
-    def _safe_area(self, h: int, extra_top: int = 0) -> int:
+    # ── Hitung area list yang aman ────────
+    def _area(self, h: int, extra_top: int = 0) -> int:
         """
-        Hitung jumlah baris yang boleh dipakai untuk list lagu.
-        Selalu menyisakan ruang untuk baris bawah (separator+status+help).
-        extra_top = baris tambahan di atas list (misal: header kolom, prompt search)
+        Hitung tinggi area daftar lagu agar tidak pernah
+        menimpa baris bawah (separator, now playing, status, help).
+        extra_top = baris tambahan di atas list (mis. header kolom, kotak cari)
         """
-        used = TOP_ROWS + extra_top + 1 + BOTTOM_ROWS  # +1 separator bawah
+        used = _TOP + extra_top + _BOT
         return max(1, h - used)
 
     # ══════════════════════════════════════
     #  LOOP UTAMA
     # ══════════════════════════════════════
     def run(self):
+        # Scan saat pertama buka
+        def _done(total):
+            self._reload()
+            self.notify(f"Scan selesai — {total} file ditemukan di music/")
+
+        self.lib.scan(on_done=_done)
+
         while True:
             self._draw()
-            key = self.screen.getch()
+            key = self.scr.getch()
 
-            # Tidak ada input — cek auto-next
+            # Tidak ada input — cek auto-next & reload scan
             if key == -1:
-                if self.engine.is_song_finished() and self.active_tracks:
-                    self._next_song()
+                if self.player.finished() and self.queue:
+                    self._next()
+                if self.lib.scanning:
+                    self._reload()
                 continue
 
-            # ── Mode mengetik (search) ─────────────────────────────────
-            if self.search_mode:
-                if key == 27:
-                    self.search_mode = False
+            # Tampilkan error player ke notif bar
+            if self.player.error:
+                self.notify(f"⚠ {self.player.error}", 4)
+                self.player.error = ""
+
+            # ── Mode mengetik pencarian ────────────────────────────────
+            if self.typing:
+                if key == 27:                              # ESC — batal mengetik
+                    self.typing = False
                     curses.curs_set(0)
                 elif key in (curses.KEY_BACKSPACE, 127, 8):
-                    self.search_query = self.search_query[:-1]
+                    self.query = self.query[:-1]
                     self._do_search()
                 elif 32 <= key <= 126:
-                    self.search_query += chr(key)
+                    self.query += chr(key)
                     self._do_search()
-                elif key == curses.KEY_DOWN:
-                    self._move(+1)
-                elif key == curses.KEY_UP:
-                    self._move(-1)
+                elif key == curses.KEY_DOWN: self._move(+1)
+                elif key == curses.KEY_UP:   self._move(-1)
                 elif key in (curses.KEY_ENTER, 10, 13):
-                    self._play_selected()
+                    self._play_sel()
                 continue
 
             # ── Mode normal ────────────────────────────────────────────
-            if   key == ord("q"):               break
-            elif key == ord("1"):               self.current_tab = self.TAB_LIBRARY
-            elif key == ord("2"):               self.current_tab = self.TAB_SEARCH
-            elif key == ord("3"):               self.current_tab = self.TAB_PLAYING
+            if   key == ord("q"):                           break
+            elif key == ord("1"):
+                self.tab = self.TAB_ALL
+                self.sel = 0; self.scroll = 0
+            elif key == ord("2"):
+                self.tab = self.TAB_SEARCH
+                self.sel = 0; self.scroll = 0
             elif key == ord("/"):
-                self.current_tab = self.TAB_SEARCH
-                self.search_mode = True
+                self.tab    = self.TAB_SEARCH
+                self.typing = True
                 curses.curs_set(1)
-            elif key == curses.KEY_DOWN:        self._move(+1)
-            elif key == curses.KEY_UP:          self._move(-1)
-            elif key in (curses.KEY_ENTER,10,13): self._play_selected()
-            elif key == ord(" "):               self.engine.toggle_pause()
-            elif key == ord("n"):               self._next_song()
-            elif key == ord("p"):               self._prev_song()
-            elif key == ord("+"):               self.engine.volume_up()
-            elif key == ord("-"):               self.engine.volume_down()
-            elif key == ord("r"):               self._start_scan()
-
-            # [FIX-3] Tampilkan error audio ke status bar
-            if self.engine.last_error:
-                self._status_msg   = f"ERR {self.engine.last_error}"
-                self._status_timer = time.time() + 4.0
-                self.engine.last_error = ""
+            elif key == curses.KEY_DOWN:                    self._move(+1)
+            elif key == curses.KEY_UP:                      self._move(-1)
+            elif key in (curses.KEY_ENTER, 10, 13):         self._play_sel()
+            elif key == ord(" "):                           self.player.toggle_pause()
+            elif key == ord("n"):                           self._next()
+            elif key == ord("p"):                           self._prev()
+            elif key == ord("+"):                           self.player.vol_up()
+            elif key == ord("-"):                           self.player.vol_down()
+            elif key == ord("r"):
+                self._reload()
+                self.lib.scan(on_done=_done)
+                self.notify("Scan ulang folder music/ ...")
 
     # ── Helpers navigasi ──────────────────
     def _do_search(self):
-        self.search_tracks = self.library.search(self.search_query)
-        self.search_sel    = 0
-        self.search_scroll = 0
+        self.results = self.lib.search(self.query)
+        self.sel = 0; self.scroll = 0
 
     def _move(self, d: int):
-        if self.current_tab == self.TAB_LIBRARY:
-            tracks, sel, scroll = self.lib_tracks, self.lib_sel, self.lib_scroll
-        else:
-            tracks, sel, scroll = (self.search_tracks,
-                                   self.search_sel, self.search_scroll)
-        if not tracks:
+        lst = self._list
+        if not lst:
             return
+        h, _ = self.scr.getmaxyx()
+        extra = 1 if self.tab == self.TAB_ALL else 3
+        area  = self._area(h, extra)
 
-        sel = (sel + d) % len(tracks)
-        h, _ = self.screen.getmaxyx()
+        self.sel = (self.sel + d) % len(lst)
 
-        extra = 1 if self.current_tab == self.TAB_LIBRARY else 3
-        area  = self._safe_area(h, extra_top=extra)
+        if self.sel < self.scroll:
+            self.scroll = self.sel
+        elif self.sel >= self.scroll + area:
+            self.scroll = self.sel - area + 1
+        self.scroll = max(0, self.scroll)
 
-        if sel < scroll:
-            scroll = sel
-        elif sel >= scroll + area:
-            scroll = sel - area + 1
-        scroll = max(0, scroll)
-
-        if self.current_tab == self.TAB_LIBRARY:
-            self.lib_sel, self.lib_scroll = sel, scroll
-        else:
-            self.search_sel, self.search_scroll = sel, scroll
-
-    def _play_selected(self):
-        if self.current_tab == self.TAB_LIBRARY:
-            tracks, sel = self.lib_tracks, self.lib_sel
-        else:
-            tracks, sel = self.search_tracks, self.search_sel
-
-        if not tracks or sel >= len(tracks):
+    def _play_sel(self):
+        lst = self._list
+        if not lst or self.sel >= len(lst):
             return
+        self.queue = list(lst)
+        self.q_idx = self.sel
+        self.player.play(lst[self.sel]["path"])
 
-        self.active_tracks = list(tracks)
-        self.active_idx    = sel
-        ok = self.engine.play(tracks[sel]["path"])
-        if ok:
-            self.current_tab = self.TAB_PLAYING
-
-    def _next_song(self):
-        if not self.active_tracks:
+    def _next(self):
+        if not self.queue:
             return
-        self.active_idx = (self.active_idx + 1) % len(self.active_tracks)
-        self.engine.play(self.active_tracks[self.active_idx]["path"])
+        self.q_idx = (self.q_idx + 1) % len(self.queue)
+        self.player.play(self.queue[self.q_idx]["path"])
 
-    def _prev_song(self):
-        if not self.active_tracks:
+    def _prev(self):
+        if not self.queue:
             return
-        self.active_idx = (self.active_idx - 1) % len(self.active_tracks)
-        self.engine.play(self.active_tracks[self.active_idx]["path"])
+        self.q_idx = (self.q_idx - 1) % len(self.queue)
+        self.player.play(self.queue[self.q_idx]["path"])
 
     # ══════════════════════════════════════
     #  GAMBAR LAYAR
     # ══════════════════════════════════════
     def _draw(self):
-        self.screen.erase()
-        h, w = self.screen.getmaxyx()
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
 
         if h < 8 or w < 30:
-            self._safe_addstr(0, 0, "Terminal terlalu kecil! Perbesar window.")
-            self.screen.refresh()
+            self._put(0, 0, "Terminal terlalu kecil — perbesar window!")
+            self.scr.refresh()
             return
 
-        # ── Atas ──────────────────────────
-        self._draw_tab_bar(w)
-        self._safe_addstr(1, 0, "─" * (w - 1), curses.color_pair(1))
+        # ── Atas ──────────────────────────────────────────
+        self._draw_tabbar(w)
+        self._line(1, w)
 
-        # ── Konten tab ────────────────────
-        if   self.current_tab == self.TAB_LIBRARY: self._draw_library(h, w)
-        elif self.current_tab == self.TAB_SEARCH:  self._draw_search(h, w)
-        elif self.current_tab == self.TAB_PLAYING: self._draw_now_playing(h, w)
+        # ── Konten tab ────────────────────────────────────
+        if self.tab == self.TAB_ALL:
+            self._draw_all(h, w)
+        else:
+            self._draw_search(h, w)
 
-        # ── [FIX-2] Bawah — selalu digambar terakhir agar tidak tertimpa ──
-        self._safe_addstr(h - BOTTOM_ROWS - 1, 0,
-                          "─" * (w - 1), curses.color_pair(1))
-        self._draw_status_bar(h, w)
-        self._draw_help_bar(h, w)
+        # ── Bawah (selalu digambar terakhir agar tidak tertimpa) ──
+        sep = h - _BOT
+        self._line(sep, w)
+        self._draw_now_playing(sep + 1, w)
+        self._draw_status(sep + 2, w)
+        self._draw_help(sep + 3, w)
 
-        self.screen.refresh()
+        self.scr.refresh()
 
-    def _draw_tab_bar(self, w):
+    # ── Tab bar ───────────────────────────
+    def _draw_tabbar(self, w):
         tabs = [
-            (self.TAB_LIBRARY, f" [1] Library ({len(self.lib_tracks)}) "),
-            (self.TAB_SEARCH,  " [2] Search "),
-            (self.TAB_PLAYING, " [3] Now Playing "),
+            (self.TAB_ALL,    f" [1] Semua ({self.lib.count()}) "),
+            (self.TAB_SEARCH, " [2] Cari "),
         ]
         x = 1
         for tid, label in tabs:
             attr = (curses.color_pair(6) | curses.A_BOLD
-                    if self.current_tab == tid
-                    else curses.color_pair(1))
-            self._safe_addstr(0, x, label, attr)
+                    if self.tab == tid else curses.color_pair(1))
+            self._put(0, x, label, attr)
             x += len(label) + 1
 
-    # ── Tab Library ───────────────────────
-    def _draw_library(self, h, w):
-        area   = self._safe_area(h, extra_top=1)   # 1 = header kolom
-        tracks = self.lib_tracks
-        sel    = self.lib_sel
-        scroll = self.lib_scroll
+        hint = f" music/ → {MUSIC_DIR.name} "
+        self._put(0, max(x + 2, w - len(hint) - 1), hint, curses.A_DIM)
 
-        if not tracks:
-            self._safe_addstr(3, 2, "Library kosong — sedang scan...",
-                              curses.color_pair(4))
+    # ── Tab: Semua ────────────────────────
+    def _draw_all(self, h, w):
+        area     = self._area(h, extra_top=1)   # 1 = baris header kolom
+        safe_bot = h - _BOT - 1                 # baris terakhir yang boleh dipakai
+        songs    = self.all_songs
+
+        if not songs:
+            if self.lib.scanning:
+                self._put(3, 2, "Sedang scan folder music/ ...", 4)
+            else:
+                self._put(3, 2, f"Folder music/ kosong.", 5)
+                self._put(4, 2, f"Tambahkan file mp3/flac/ogg ke: {MUSIC_DIR}", 4)
             return
 
-        hdr = f"  {'#':>4}  {'Artis':<18}  {'Judul':<26}  {'Album':<16}  Dur"
-        self._safe_addstr(2, 0, hdr[:w - 1], curses.color_pair(1))
-
-        # Batas bawah yang AMAN untuk menggambar baris list
-        safe_bottom = h - BOTTOM_ROWS - 2
+        # Header kolom
+        hdr = f"  {'#':>4}  {'Judul':<30}  {'Artis':<22}  Dur"
+        self._put(2, 0, hdr[:w - 1], 1)
 
         for i in range(area):
-            row_y = 3 + i
-            tidx  = i + scroll
-            if row_y > safe_bottom or tidx >= len(tracks):
+            y   = 3 + i
+            idx = i + self.scroll
+            if y > safe_bot or idx >= len(songs):
                 break
-            self._draw_track_row(row_y, tracks[tidx], tidx, sel, w)
+            self._draw_row(y, songs[idx], idx, w)
 
-    # ── Tab Search ────────────────────────
+    # ── Tab: Cari ─────────────────────────
     def _draw_search(self, h, w):
-        cursor = "█" if self.search_mode else " "
-        prompt = f" Cari: {self.search_query}{cursor}"
-        self._safe_addstr(2, 0, prompt[:w - 1],
-                          curses.color_pair(4) | curses.A_BOLD)
-        self._safe_addstr(3, 0, "─" * min(len(prompt) + 2, w - 1),
-                          curses.color_pair(4))
+        cur    = "█" if self.typing else " "
+        prompt = f" Cari: {self.query}{cur}"
+        self._put(2, 0, prompt[:w - 1], curses.color_pair(4) | curses.A_BOLD)
+        self._line_dim(3, min(len(prompt) + 2, w - 1))
 
-        tracks = self.search_tracks
-        sel    = self.search_sel
-        scroll = self.search_scroll
-        area   = self._safe_area(h, extra_top=3)  # prompt + sep + label
+        area     = self._area(h, extra_top=3)   # prompt + garis + label hasil
+        safe_bot = h - _BOT - 1
+        songs    = self.results
 
-        if not tracks and self.search_query:
-            self._safe_addstr(5, 2,
-                              f"Tidak ada hasil untuk '{self.search_query}'",
-                              curses.color_pair(5))
-            return
-        if not tracks:
-            self._safe_addstr(5, 2,
-                              "Tekan  /  lalu ketik untuk mencari.",
-                              curses.color_pair(4))
+        if not songs:
+            msg = (f"Tidak ada hasil untuk '{self.query}'"
+                   if self.query else "Tekan  /  lalu ketik untuk mencari.")
+            self._put(5, 2, msg, 5 if self.query else 4)
             return
 
-        self._safe_addstr(4, 0, f"  {len(tracks)} hasil", curses.color_pair(1))
+        self._put(4, 0, f"  {len(songs)} hasil ditemukan", 1)
 
-        safe_bottom = h - BOTTOM_ROWS - 2
         for i in range(area):
-            row_y = 5 + i
-            tidx  = i + scroll
-            if row_y > safe_bottom or tidx >= len(tracks):
+            y   = 5 + i
+            idx = i + self.scroll
+            if y > safe_bot or idx >= len(songs):
                 break
-            self._draw_track_row(row_y, tracks[tidx], tidx, sel, w)
+            self._draw_row(y, songs[idx], idx, w)
 
-    # ── Baris lagu ────────────────────────
-    def _draw_track_row(self, y, track, idx, sel_idx, w):
-        is_sel  = (idx == sel_idx)
+    # ── Satu baris lagu ───────────────────
+    def _draw_row(self, y, song, idx, w):
+        is_sel  = (idx == self.sel)
         is_play = (
-            self.engine.is_playing
-            and self.active_tracks
-            and 0 <= self.active_idx < len(self.active_tracks)
-            and self.active_tracks[self.active_idx].get("path") == track["path"]
+            self.player.playing
+            and bool(self.queue)
+            and 0 <= self.q_idx < len(self.queue)
+            and self.queue[self.q_idx]["path"] == song["path"]
         )
 
         marker = "▶" if is_play else " "
-        row = (
-            f" {marker}{idx+1:>4}  "
-            f"{track['artist'][:18]:<18}  "
-            f"{track['title'][:26]:<26}  "
-            f"{track['album'][:16]:<16}  "
-            f"{self._fmt_dur(track['duration'])}"
-        )
-        row = row[:w - 1]
+        title  = (song["title"]  or Path(song["path"]).stem)[:30]
+        artist = (song["artist"] or "—")[:22]
+        dur    = self._fmt(song["duration"])
 
-        if is_sel:
-            attr = curses.color_pair(3)
-        elif is_play:
-            attr = curses.color_pair(2) | curses.A_BOLD
-        else:
-            attr = curses.A_NORMAL
+        row = f" {marker}{idx+1:>4}  {title:<30}  {artist:<22}  {dur}"
 
-        self._safe_addstr(y, 0, row.ljust(w - 1), attr)
+        # Pad ke lebar penuh — karakter lama ikut tertimpa
+        row = row[:w - 1].ljust(w - 1)
 
-    # ── Tab Now Playing ───────────────────
-    def _draw_now_playing(self, h, w):
-        content_top = 2
-        content_bot = h - BOTTOM_ROWS - 2
+        if is_sel:    attr = curses.color_pair(3)
+        elif is_play: attr = curses.color_pair(2) | curses.A_BOLD
+        else:         attr = curses.A_NORMAL
 
-        if not self.engine.is_playing or not self.active_tracks:
-            mid = (content_top + content_bot) // 2
-            msg = "Tidak ada lagu yang sedang diputar"
-            self._safe_addstr(mid, max(0, w // 2 - len(msg) // 2),
-                              msg, curses.color_pair(5))
+        self._put(y, 0, row, attr)
+
+    # ── Now Playing bar ───────────────────
+    def _draw_now_playing(self, y, w):
+        if not self.player.playing or not self.queue:
+            self._put(y, 0, " ■  Tidak ada lagu".ljust(w - 1), curses.A_DIM)
             return
 
-        track = self.active_tracks[self.active_idx]
-        state = "PAUSED" if self.engine.is_paused else "NOW PLAYING"
-        pos   = self._fmt_dur(self.engine.get_position())
-        total = self._fmt_dur(track["duration"])
-        pbar  = self._progress_bar(track["duration"], w)
-        pinfo = f"Lagu {self.active_idx + 1} dari {len(self.active_tracks)}"
+        song  = self.queue[self.q_idx]
+        state = "⏸" if self.player.paused else "▶"
+        title = (song["title"] or Path(song["path"]).stem)[:28]
+        artist= (song["artist"] or "")[:18]
+        pos   = self._fmt(self.player.position())
+        tot   = self._fmt(song["duration"])
+        pbar  = self._pbar(song["duration"], 16)
 
-        lines = [
-            (f"[ {state} ]",       curses.color_pair(2) | curses.A_BOLD),
-            ("",                   curses.A_NORMAL),
-            (track["title"],       curses.A_BOLD),
-            (track["artist"],      curses.color_pair(1)),
-            (track["album"],       curses.A_DIM),
-            ("",                   curses.A_NORMAL),
-            (f"{pos}  /  {total}", curses.color_pair(4)),
-            (pbar,                 curses.color_pair(2)),
-            ("",                   curses.A_NORMAL),
-            (pinfo,                curses.A_DIM),
-        ]
+        # Bagian kanan: waktu + progress (selalu tampil)
+        right = f"  {pos}/{tot} {pbar} "
+        # Bagian kiri: status + judul + artis
+        left  = f" {state}  {title}"
+        if artist:
+            left += f"  —  {artist}"
 
-        mid_y = (content_top + content_bot) // 2
-        start = max(content_top, mid_y - len(lines) // 2)
-        for i, (text, attr) in enumerate(lines):
-            y = start + i
-            if y > content_bot:
-                break
-            x = max(0, w // 2 - len(text) // 2)
-            self._safe_addstr(y, x, text[:w - 2], attr)
+        # Gabungkan tanpa overflow
+        max_left = max(0, w - len(right) - 1)
+        line     = left[:max_left].ljust(max_left) + right
+        line     = line[:w - 1].ljust(w - 1)
 
-    # ── Status bar & help ─────────────────
-    def _draw_status_bar(self, h, w):
-        vol_pct = int(self.engine.volume * 100)
-        vol_bar = "█" * (vol_pct // 10) + "░" * (10 - vol_pct // 10)
-        total   = self.library.total_songs()
+        self._put(y, 0, line, curses.color_pair(2) | curses.A_BOLD)
 
-        if self.library.scan_running:
-            prog = self.library.scan_progress
-            maxt = max(1, self.library.scan_total)
-            pct  = int(prog / maxt * 100)
+    # ── Status bar ────────────────────────
+    def _draw_status(self, y, w):
+        vol     = int(self.player.volume * 100)
+        vol_bar = "█" * (vol // 10) + "░" * (10 - vol // 10)
+
+        # Bagian kanan: volume (selalu tampil)
+        right = f"  Vol [{vol_bar}] {vol}% "
+
+        # Bagian kiri: notif / scan progress / jumlah lagu
+        if self.lib.scanning:
+            done = self.lib.scan_done
+            tot  = max(1, self.lib.scan_total)
+            pct  = int(done / tot * 100)
             bar  = "█" * (pct // 5) + "░" * (20 - pct // 5)
-            left = f" [{bar}] {pct}% ({prog}/{maxt})"
-        elif self._status_msg and time.time() < self._status_timer:
-            left = f" {self._status_msg}"
+            left = f" Scan [{bar}] {pct}%"
+        elif self._msg and time.time() < self._msg_t:
+            left = f" {self._msg}"
         else:
-            left = f" {total} lagu"
+            warn = ""
+            if not PYGAME_OK:  warn += " ⚠pygame"
+            if not MUTAGEN_OK: warn += " ⚠mutagen"
+            left = f" {self.lib.count()} lagu di music/{warn}"
 
-        right = f"  Vol [{vol_bar}] {vol_pct}% "
-        pad   = max(0, w - len(right) - 1)
-        line  = left[:pad].ljust(pad) + right
-        self._safe_addstr(h - 2, 0, line[:w - 1], curses.color_pair(4))
+        max_left = max(0, w - len(right) - 1)
+        line     = left[:max_left].ljust(max_left) + right
+        self._put(y, 0, line[:w - 1].ljust(w - 1), 4)
 
-    def _draw_help_bar(self, h, w):
-        txt = "  1-3:Tab  /:Cari  ENTER:Putar  SPACE:Pause  n/p:Skip  +/-:Vol  r:Scan  q:Keluar"
-        self._safe_addstr(h - 1, 0, txt[:w - 1], curses.A_DIM)
+    # ── Help bar ──────────────────────────
+    def _draw_help(self, y, w):
+        txt = " 1/2:Tab  /:Cari  ENTER:Putar  SPC:Pause  n/p:Skip  +/-:Vol  r:Refresh  q:Keluar"
+        # Pad penuh — hindari karakter sisa di baris paling bawah
+        self._put(y, 0, txt[:w - 1].ljust(w - 1), curses.A_DIM)
 
-    # ── Utilities ─────────────────────────
-    def _progress_bar(self, total_sec: float, w: int) -> str:
-        if total_sec <= 0 or not self.engine.is_playing:
-            return ""
-        pct    = min(1.0, self.engine.get_position() / total_sec)
-        bar_w  = min(44, max(10, w - 8))
-        filled = int(pct * bar_w)
-        return "█" * filled + "░" * (bar_w - filled)
-
-    @staticmethod
-    def _fmt_dur(seconds: float) -> str:
-        s = max(0, int(seconds))
-        return f"{s // 60:02d}:{s % 60:02d}"
-
-    def _safe_addstr(self, y, x, text, attr=curses.A_NORMAL):
-        h, w = self.screen.getmaxyx()
+    # ══════════════════════════════════════
+    #  UTILITAS GAMBAR
+    # ══════════════════════════════════════
+    def _put(self, y, x, text, color=curses.A_NORMAL):
+        """Tulis teks ke layar dengan aman. Bersihkan sisa baris sesudahnya."""
+        h, w = self.scr.getmaxyx()
         if y < 0 or y >= h or x < 0 or x >= w:
             return
         try:
-            self.screen.addstr(y, x, text, attr)
+            attr = curses.color_pair(color) if isinstance(color, int) and color > 0 else color
+            self.scr.addstr(y, x, str(text), attr)
+            # Bersihkan sisa karakter di baris ini (kecuali baris paling bawah)
+            if y < h - 1:
+                self.scr.clrtoeol()
         except curses.error:
             pass
+
+    def _line(self, y, w):
+        """Gambar garis pemisah horizontal."""
+        self._put(y, 0, "─" * (w - 1), 1)
+
+    def _line_dim(self, y, length):
+        """Gambar garis pemisah pendek (untuk bawah kotak cari)."""
+        self._put(y, 0, "─" * length, 4)
+
+    def _pbar(self, total: float, width: int) -> str:
+        """Progress bar sederhana."""
+        if total <= 0 or not self.player.playing:
+            return "░" * width
+        pct    = min(1.0, self.player.position() / total)
+        filled = int(pct * width)
+        return "█" * filled + "░" * (width - filled)
+
+    @staticmethod
+    def _fmt(s: float) -> str:
+        """Format detik → mm:ss."""
+        s = max(0, int(s))
+        return f"{s // 60:02d}:{s % 60:02d}"
 
 
 # ══════════════════════════════════════════
 #  TITIK MASUK
 # ══════════════════════════════════════════
 def main(stdscr):
-    folder  = sys.argv[1] if len(sys.argv) > 1 else os.path.expanduser("~/Music")
-    library = MusicLibrary()
-    engine  = AudioEngine()
+    setup_music_folder()
+    lib    = Library()
+    player = Player()
     try:
-        tui = LibraryTUI(stdscr, library, engine, folder)
-        tui.run()
+        TUI(stdscr, lib, player).run()
     finally:
-        engine.stop()
-        engine.cleanup()
-        library.close()
-        sys.stderr = sys.__stderr__   # kembalikan stderr ke normal
+        player.stop()
+        player.cleanup()
+        lib.close()
+        sys.stderr = sys.__stderr__
 
 
 if __name__ == "__main__":
