@@ -36,16 +36,29 @@ Kontrol:
 """
 
 # ─────────────────────────────────────────
-#  Redirect stderr ke log file
+#  Redirect stderr ke log file — 2 LEVEL
 #  Harus dilakukan SEBELUM import lain
-#  agar pesan error tidak merusak tampilan
+#
+#  Level 1 → sys.stderr : tangkap error Python
+#  Level 2 → os.dup2()  : tangkap error library C
+#             (libmpg123, libFLAC, dll) yang
+#             menulis langsung ke fd 2 sistem,
+#             melewati sys.stderr Python.
+#             Inilah penyebab pesan:
+#             [src/libmpg123/id3.c:process_comment()]
+#             muncul di layar dan merusak tampilan.
 # ─────────────────────────────────────────
 import sys, os
 from pathlib import Path
 
-_BASE   = Path(__file__).parent.resolve()
-_LOG    = open(_BASE / "player.log", "a", buffering=1)
+_BASE = Path(__file__).parent.resolve()
+_LOG  = open(_BASE / "player.log", "a", buffering=1)
+
+# Level 1: Python stderr
 sys.stderr = _LOG
+
+# Level 2: OS file descriptor — tangkap output C library
+os.dup2(_LOG.fileno(), 2)
 
 # ─────────────────────────────────────────
 #  Import standar
@@ -64,6 +77,14 @@ try:
     PYGAME_OK = True
 except ImportError:
     PYGAME_OK = False
+
+try:
+    import vlc
+    # Test apakah VLC benar-benar bisa dipakai
+    _vlc_inst = vlc.Instance("--no-xlib", "--quiet", "--no-video")
+    VLC_OK    = True
+except Exception:
+    VLC_OK = False
 
 try:
     with warnings.catch_warnings():
@@ -265,99 +286,200 @@ class Library:
 #  KELAS: Player  (Audio Engine)
 # ══════════════════════════════════════════
 class Player:
-    """Putar, pause, stop audio. Semua urusan pygame ada di sini."""
+    """
+    Audio engine dengan fallback otomatis:
+      1. Pygame  → coba pertama (ringan, cepat)
+      2. VLC     → fallback jika pygame gagal (support semua format)
+
+    Property engine_ menunjukkan engine mana yang aktif saat ini.
+    """
+
+    ENGINE_NONE   = "none"
+    ENGINE_PYGAME = "pygame"
+    ENGINE_VLC    = "vlc"
 
     def __init__(self):
         self.playing = False
         self.paused  = False
         self.volume  = 0.7
         self.error   = ""
+        self._engine = self.ENGINE_NONE   # engine yang sedang aktif
+        self._vlc_mp = None               # VLC MediaPlayer instance
 
+        # Inisialisasi pygame
         if PYGAME_OK:
-            pygame.mixer.init(44100, -16, 2, 2048)
-            pygame.mixer.music.set_volume(self.volume)
+            try:
+                pygame.mixer.init(44100, -16, 2, 2048)
+                pygame.mixer.music.set_volume(self.volume)
+            except Exception as e:
+                print(f"[pygame init] {e}", file=sys.__stderr__)
 
+        # Inisialisasi VLC (instance tunggal, hemat resource)
+        if VLC_OK:
+            try:
+                self._vlc_inst = vlc.Instance("--no-xlib", "--quiet", "--no-video")
+                self._vlc_mp   = self._vlc_inst.media_player_new()
+                self._vlc_mp.audio_set_volume(int(self.volume * 100))
+            except Exception as e:
+                print(f"[vlc init] {e}", file=sys.__stderr__)
+                self._vlc_mp = None
+
+    @property
+    def engine_label(self) -> str:
+        """Label engine aktif untuk ditampilkan di UI."""
+        return {"pygame": "PG", "vlc": "VLC", "none": "--"}[self._engine]
+
+    # ══════════════════════════════════════
+    #  PLAY — coba pygame dulu, fallback VLC
+    # ══════════════════════════════════════
     def play(self, path: str) -> bool:
-        """Putar file. Kembalikan True jika berhasil."""
-        self.error = ""
+        self.error   = ""
+        self._engine = self.ENGINE_NONE
         p = Path(path)
 
-        # Validasi file sebelum diputar
+        # Validasi file
         if not p.exists():
             self.error = f"File tidak ada: {p.name[:40]}"
             return False
         if p.stat().st_size == 0:
             self.error = f"File kosong: {p.name[:40]}"
             return False
-        if not PYGAME_OK:
-            self.error = "pygame belum terinstall"
-            return False
 
-        # Coba putar dengan music loader (hemat RAM)
-        try:
-            pygame.mixer.music.load(str(p))
-            pygame.mixer.music.play()
-            self.playing = True
-            self.paused  = False
-            return True
-        except Exception as e:
-            print(f"[play/music] {p.name}: {e}", file=sys.__stderr__)
+        # ── Coba 1: pygame music loader ───────────────────────────
+        if PYGAME_OK:
+            try:
+                pygame.mixer.music.stop()
+                pygame.mixer.music.load(str(p))
+                pygame.mixer.music.play()
+                self.playing = True
+                self.paused  = False
+                self._engine = self.ENGINE_PYGAME
+                self._stop_vlc()   # pastikan VLC tidak ikut jalan
+                return True
+            except Exception as e:
+                print(f"[pygame] {p.name}: {e}", file=sys.__stderr__)
 
-        # Fallback ke Sound loader
-        try:
-            snd = pygame.mixer.Sound(str(p))
-            snd.set_volume(self.volume)
-            pygame.mixer.stop()
-            snd.play()
-            self.playing = True
-            self.paused  = False
-            return True
-        except Exception as e:
-            self.error   = f"Gagal diputar: {p.name[:35]}"
-            self.playing = False
-            print(f"[play/sound] {p.name}: {e}", file=sys.__stderr__)
-            return False
+        # ── Coba 2: VLC fallback ──────────────────────────────────
+        if VLC_OK and self._vlc_mp:
+            try:
+                self._stop_pygame()
+                media = self._vlc_inst.media_new(str(p))
+                self._vlc_mp.set_media(media)
+                self._vlc_mp.audio_set_volume(int(self.volume * 100))
+                self._vlc_mp.play()
+                # Tunggu sebentar sampai VLC benar-benar mulai
+                time.sleep(0.15)
+                state = self._vlc_mp.get_state()
+                if state not in (vlc.State.Error, vlc.State.Ended):
+                    self.playing = True
+                    self.paused  = False
+                    self._engine = self.ENGINE_VLC
+                    return True
+                else:
+                    self._vlc_mp.stop()
+            except Exception as e:
+                print(f"[vlc] {p.name}: {e}", file=sys.__stderr__)
 
+        # ── Gagal semua ────────────────────────────────────────────
+        self.error   = f"Tidak bisa diputar: {p.name[:35]}"
+        self.playing = False
+        return False
+
+    # ── Internal stop helpers ─────────────
+    def _stop_pygame(self):
+        if PYGAME_OK:
+            try:
+                pygame.mixer.music.stop()
+            except Exception:
+                pass
+
+    def _stop_vlc(self):
+        if VLC_OK and self._vlc_mp:
+            try:
+                self._vlc_mp.stop()
+            except Exception:
+                pass
+
+    # ══════════════════════════════════════
+    #  KONTROL PLAYBACK
+    # ══════════════════════════════════════
     def toggle_pause(self):
-        if not PYGAME_OK or not self.playing:
+        if not self.playing:
             return
-        if self.paused:
-            pygame.mixer.music.unpause()
-            self.paused = False
-        else:
-            pygame.mixer.music.pause()
-            self.paused = True
+        if self._engine == self.ENGINE_PYGAME and PYGAME_OK:
+            if self.paused:
+                pygame.mixer.music.unpause()
+            else:
+                pygame.mixer.music.pause()
+            self.paused = not self.paused
+
+        elif self._engine == self.ENGINE_VLC and self._vlc_mp:
+            self._vlc_mp.pause()   # VLC toggle otomatis
+            self.paused = not self.paused
 
     def stop(self):
-        if PYGAME_OK:
-            pygame.mixer.music.stop()
+        self._stop_pygame()
+        self._stop_vlc()
         self.playing = False
         self.paused  = False
+        self._engine = self.ENGINE_NONE
 
     def finished(self) -> bool:
-        if not PYGAME_OK or not self.playing or self.paused:
+        if not self.playing or self.paused:
             return False
-        return not pygame.mixer.music.get_busy()
+        if self._engine == self.ENGINE_PYGAME and PYGAME_OK:
+            return not pygame.mixer.music.get_busy()
+        if self._engine == self.ENGINE_VLC and self._vlc_mp:
+            state = self._vlc_mp.get_state()
+            return state in (vlc.State.Ended, vlc.State.Stopped)
+        return False
+
+    # ══════════════════════════════════════
+    #  VOLUME
+    # ══════════════════════════════════════
+    def _apply_volume(self):
+        if PYGAME_OK:
+            try:
+                pygame.mixer.music.set_volume(self.volume)
+            except Exception:
+                pass
+        if VLC_OK and self._vlc_mp:
+            try:
+                self._vlc_mp.audio_set_volume(int(self.volume * 100))
+            except Exception:
+                pass
 
     def vol_up(self):
         self.volume = min(1.0, self.volume + 0.05)
-        if PYGAME_OK:
-            pygame.mixer.music.set_volume(self.volume)
+        self._apply_volume()
 
     def vol_down(self):
         self.volume = max(0.0, self.volume - 0.05)
-        if PYGAME_OK:
-            pygame.mixer.music.set_volume(self.volume)
+        self._apply_volume()
 
+    # ══════════════════════════════════════
+    #  POSISI
+    # ══════════════════════════════════════
     def position(self) -> float:
-        if not PYGAME_OK or not self.playing:
+        if not self.playing:
             return 0.0
-        ms = pygame.mixer.music.get_pos()
-        return ms / 1000.0 if ms >= 0 else 0.0
+        if self._engine == self.ENGINE_PYGAME and PYGAME_OK:
+            ms = pygame.mixer.music.get_pos()
+            return ms / 1000.0 if ms >= 0 else 0.0
+        if self._engine == self.ENGINE_VLC and self._vlc_mp:
+            ms = self._vlc_mp.get_time()
+            return ms / 1000.0 if ms >= 0 else 0.0
+        return 0.0
 
     def cleanup(self):
+        self._stop_vlc()
+        if VLC_OK and self._vlc_mp:
+            self._vlc_mp.release()
         if PYGAME_OK:
-            pygame.mixer.quit()
+            try:
+                pygame.mixer.quit()
+            except Exception:
+                pass
 
 
 # ══════════════════════════════════════════
@@ -721,7 +843,9 @@ class TUI:
             warn = ""
             if not PYGAME_OK:  warn += " ⚠pygame"
             if not MUTAGEN_OK: warn += " ⚠mutagen"
-            left = f" {self.lib.count()} lagu di music/{warn}"
+            if not VLC_OK:     warn += " ⚠vlc"
+            eng  = self.player.engine_label
+            left = f" {self.lib.count()} lagu di music/  [{eng}]{warn}"
 
         max_left = max(0, w - len(right) - 1)
         line     = left[:max_left].ljust(max_left) + right
@@ -786,6 +910,8 @@ def main(stdscr):
         player.stop()
         player.cleanup()
         lib.close()
+        # Kembalikan fd 2 ke stderr asli terminal
+        os.dup2(sys.__stderr__.fileno(), 2)
         sys.stderr = sys.__stderr__
 
 
