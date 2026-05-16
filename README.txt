@@ -5,4 +5,5 @@ Format yang didukung: mp3, flac, ogg, wav, m4a, aac
 Subfolder juga terbaca otomatis.
 
 Setelah menambah lagu, tekan  r  di player untuk refresh.
-Setelah menggunakan,hapus file player.log
+
+Setelah mengakhiri sesi pengguaan,diharuskan untuk menghapus file player.log
